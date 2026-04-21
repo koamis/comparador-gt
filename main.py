@@ -3,249 +3,184 @@ import sqlite3
 import datetime
 import asyncio
 import httpx
+import logging
 from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse
 from bs4 import BeautifulSoup
 from playwright.async_api import async_playwright
 
-# 1. INICIALIZACIÓN
+# Configuración de Logs para ver errores en Railway
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 app = FastAPI()
 
+# Ruta de base de datos absoluta para evitar errores de permisos
+DB_PATH = os.path.join(os.getcwd(), "precios_gt.db")
+
 def init_db():
-    conn = sqlite3.connect('precios_gt.db')
-    cursor = conn.cursor()
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS productos (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            busqueda TEXT,
-            tienda TEXT,
-            nombre TEXT,
-            precio_texto TEXT,
-            precio_num REAL,
-            link TEXT,
-            imagen TEXT,
-            fecha TIMESTAMP
-        )
-    ''')
-    conn.commit()
-    conn.close()
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS productos (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                busqueda TEXT, tienda TEXT, nombre TEXT,
+                precio_texto TEXT, precio_num REAL, link TEXT,
+                imagen TEXT, fecha TIMESTAMP
+            )
+        ''')
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logger.error(f"Error DB: {e}")
 
 init_db()
 
-# 2. FUNCIONES DE APOYO (DB)
-def obtener_cache(busqueda):
-    try:
-        conn = sqlite3.connect('precios_gt.db')
-        cursor = conn.cursor()
-        hace_12_horas = datetime.datetime.now() - datetime.timedelta(hours=12)
-        cursor.execute('SELECT tienda, nombre, precio_texto, link, imagen FROM productos WHERE busqueda = ? AND fecha > ?', (busqueda.lower(), hace_12_horas))
-        rows = cursor.fetchall()
-        conn.close()
-        if rows:
-            res = []
-            for r in rows:
-                res.append({"tienda": r[0], "nombre": r[1], "precio": r[2], "link": r[3], "imagen": r[4]})
-            return res
-    except:
-        return None
-    return None
-
-def guardar_en_db(busqueda, resultados):
-    try:
-        conn = sqlite3.connect('precios_gt.db')
-        cursor = conn.cursor()
-        fecha = datetime.datetime.now()
-        for r in resultados:
-            try:
-                p_num = float(r['precio'].replace('Q', '').replace(',', '').strip())
-            except:
-                p_num = 0
-            cursor.execute('INSERT INTO productos (busqueda, tienda, nombre, precio_texto, precio_num, link, imagen, fecha) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-                           (busqueda.lower(), r['tienda'], r['nombre'], r['precio'], p_num, r['link'], r['imagen'], fecha))
-        conn.commit()
-        conn.close()
-    except:
-        pass
-
-# 3. SCRAPERS
 async def buscar_magento(client, producto, tienda, url_base):
     url = f"{url_base}/catalogsearch/result/?q={producto}"
-    resultados = []
     try:
-        resp = await client.get(url, timeout=15.0)
+        resp = await client.get(url, timeout=10.0)
         soup = BeautifulSoup(resp.text, 'html.parser')
-        items = soup.find_all('li', class_='item product product-item')[:5]
+        items = soup.find_all('li', class_='item product product-item')[:3]
+        res = []
         for i in items:
-            nombre_tag = i.find('a', class_='product-item-link')
-            precio_tag = i.find('span', class_='price')
-            img_tag = i.find('img', class_='product-image-photo')
-            if nombre_tag and precio_tag:
-                resultados.append({
-                    "tienda": tienda,
-                    "nombre": nombre_tag.text.strip(),
-                    "precio": precio_tag.text.strip(),
-                    "link": nombre_tag['href'],
-                    "imagen": img_tag.get('src') if img_tag else ""
-                })
-    except:
-        pass
-    return resultados
+            n = i.find('a', class_='product-item-link')
+            p = i.find('span', class_='price')
+            img = i.find('img', class_='product-image-photo')
+            if n and p:
+                res.append({"tienda": tienda, "nombre": n.text.strip(), "precio": p.text.strip(), "link": n['href'], "imagen": img.get('src') if img else ""})
+        return res
+    except: return []
 
 async def buscar_pacifiko(client, producto):
     url = f"https://www.pacifiko.com/busqueda?q={producto}"
-    resultados = []
     try:
-        resp = await client.get(url, timeout=15.0)
+        resp = await client.get(url, timeout=10.0)
         soup = BeautifulSoup(resp.text, 'html.parser')
-        items = soup.find_all('div', class_='product-block')[:5]
+        items = soup.find_all('div', class_='product-block')[:3]
+        res = []
         for i in items:
-            nombre_tag = i.find('div', class_='name')
-            precio_tag = i.find('div', class_='price')
-            link_tag = i.find('a')
-            img_tag = i.find('img')
-            if nombre_tag and precio_tag and link_tag:
-                resultados.append({
-                    "tienda": "Pacifiko",
-                    "nombre": nombre_tag.text.strip(),
-                    "precio": precio_tag.text.strip(),
-                    "link": "https://www.pacifiko.com" + link_tag['href'],
-                    "imagen": img_tag.get('src') if img_tag else ""
-                })
-    except:
-        pass
-    return resultados
+            n = i.find('div', class_='name')
+            p = i.find('div', class_='price')
+            l = i.find('a')
+            img = i.find('img')
+            if n and p:
+                res.append({"tienda": "Pacifiko", "nombre": n.text.strip(), "precio": p.text.strip(), "link": "https://www.pacifiko.com" + l['href'], "imagen": img.get('src') if img else ""})
+        return res
+    except: return []
 
-async def scraper_vtex_generic(browser, url, tienda, dominio):
-    resultados = []
+async def scraper_vtex(browser, url, tienda, dominio):
+    context = await browser.new_context(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+    page = await context.new_page()
+    res = []
     try:
-        page = await browser.new_page()
-        await page.goto(url, wait_until="networkidle", timeout=30000)
+        await page.goto(url, wait_until="domcontentloaded", timeout=20000)
+        # Esperar un poco por los precios
+        await asyncio.sleep(2)
         items = await page.query_selector_all(".vtex-search-result-3-x-galleryItem")
-        for item in items[:5]:
-            nombre_el = await item.query_selector(".vtex-product-summary-2-x-productBrandText")
-            precio_el = await item.query_selector(".vtex-product-price-1-x-currencyInteger")
-            link_el = await item.query_selector("a")
-            img_el = await item.query_selector("img")
-            if nombre_el and precio_el and link_el:
-                p_text = await precio_el.inner_text()
-                href = await link_el.get_attribute("href")
-                resultados.append({
-                    "tienda": tienda,
-                    "nombre": await nombre_el.inner_text(),
-                    "precio": f"Q{p_text}",
+        for item in items[:3]:
+            n = await item.query_selector(".vtex-product-summary-2-x-productBrandText")
+            p = await item.query_selector(".vtex-product-price-1-x-currencyInteger")
+            l = await item.query_selector("a")
+            img = await item.query_selector("img")
+            if n and p:
+                href = await l.get_attribute("href")
+                res.append({
+                    "tienda": tienda, "nombre": await n.inner_text(), "precio": f"Q{await p.inner_text()}",
                     "link": href if "http" in href else f"https://www.{dominio}{href}",
-                    "imagen": await img_el.get_attribute("src") if img_el else ""
+                    "imagen": await img.get_attribute("src") if img else ""
                 })
+    except Exception as e:
+        logger.error(f"Error en {tienda}: {e}")
+    finally:
         await page.close()
-    except:
-        pass
-    return resultados
+        await context.close()
+    return res
 
-# 4. RUTAS (HTML Y API)
 @app.get("/", response_class=HTMLResponse)
 async def home():
-    html_content = """
+    return """
     <!DOCTYPE html>
     <html lang="es">
     <head>
-        <meta charset="UTF-8">
-        <title>PRECIOS-GT | Buscador</title>
+        <meta charset="UTF-8"><title>PRECIOS-GT</title>
         <script src="https://cdn.tailwindcss.com"></script>
         <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
     </head>
-    <body class="bg-slate-100 min-h-screen font-sans">
-        <nav class="bg-indigo-700 p-4 text-white shadow-md">
-            <div class="container mx-auto font-bold text-xl uppercase tracking-widest">Precios Guatemala</div>
-        </nav>
-        <main class="container mx-auto p-4 max-w-5xl">
-            <div class="bg-white p-6 rounded-3xl shadow-lg my-8 flex gap-2">
-                <input type="text" id="q" placeholder="¿Qué quieres comprar?" class="flex-1 p-3 outline-none">
-                <button onclick="buscar()" class="bg-indigo-600 text-white px-8 py-3 rounded-2xl font-bold">BUSCAR</button>
+    <body class="bg-slate-100">
+        <nav class="bg-indigo-700 p-4 text-white font-bold text-center">PRECIOS GUATEMALA</nav>
+        <main class="container mx-auto p-4 max-w-4xl">
+            <div class="bg-white p-6 rounded-2xl shadow-lg my-6 flex gap-2">
+                <input type="text" id="q" placeholder="Ej: iPhone, Leche, TV..." class="flex-1 p-2 border-b outline-none">
+                <button onclick="buscar()" class="bg-indigo-600 text-white px-6 py-2 rounded-xl">BUSCAR</button>
             </div>
-            <div id="loading" class="hidden text-center py-10">
-                <div class="animate-spin h-10 w-10 border-4 border-indigo-600 border-t-transparent rounded-full mx-auto"></div>
-                <p class="mt-4 text-indigo-700 font-bold italic">Consultando precios...</p>
-            </div>
-            <div id="results" class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-6"></div>
+            <div id="load" class="hidden text-center py-10 font-bold text-indigo-600 animate-pulse">Buscando en tiendas de GT...</div>
+            <div id="res" class="grid grid-cols-1 md:grid-cols-3 gap-4"></div>
         </main>
         <script>
             async function buscar() {
                 const q = document.getElementById('q').value;
-                const resDiv = document.getElementById('results');
-                const load = document.getElementById('loading');
                 if(!q) return;
-                resDiv.innerHTML = ''; 
-                load.classList.remove('hidden');
+                document.getElementById('res').innerHTML = '';
+                document.getElementById('load').classList.remove('hidden');
                 try {
-                    const resp = await fetch(`/buscar?q=${encodeURIComponent(q)}`);
-                    const datos = await resp.json();
-                    load.classList.add('hidden');
-                    if(datos.length === 0) {
-                        resDiv.innerHTML = '<p class="col-span-full text-center text-gray-500">No se encontraron productos.</p>';
-                        return;
-                    }
-                    datos.forEach(p => {
-                        resDiv.innerHTML += `
-                            <div class="bg-white p-4 rounded-2xl shadow-sm border flex flex-col hover:shadow-xl transition">
-                                <img src="${p.imagen}" class="h-40 object-contain mb-4">
-                                <span class="text-[10px] font-black text-indigo-500 uppercase tracking-tighter">${p.tienda}</span>
-                                <h3 class="text-sm font-bold text-slate-700 mb-4 h-10 line-clamp-2">${p.nombre}</h3>
-                                <div class="mt-auto flex justify-between items-center">
-                                    <span class="text-xl font-black text-slate-900">${p.precio}</span>
-                                    <a href="${p.link}" target="_blank" class="bg-indigo-600 text-white p-2 px-4 rounded-xl text-xs font-bold">VER</a>
+                    const r = await fetch(`/buscar?q=${encodeURIComponent(q)}`);
+                    const data = await r.json();
+                    document.getElementById('load').classList.add('hidden');
+                    if(data.length === 0) { document.getElementById('res').innerHTML = '<p class="col-span-full text-center">No se hallaron resultados.</p>'; return; }
+                    data.forEach(p => {
+                        document.getElementById('res').innerHTML += `
+                            <div class="bg-white p-4 rounded-xl shadow border">
+                                <img src="${p.imagen}" class="h-32 w-full object-contain mb-2">
+                                <p class="text-[10px] font-bold text-indigo-500">${p.tienda}</p>
+                                <h3 class="text-xs font-bold h-8 overflow-hidden">${p.nombre}</h3>
+                                <div class="flex justify-between items-center mt-4">
+                                    <span class="font-black">${p.precio}</span>
+                                    <a href="${p.link}" target="_blank" class="bg-indigo-600 text-white p-2 rounded text-xs">VER</a>
                                 </div>
                             </div>`;
                     });
                 } catch(e) { 
-                    load.classList.add('hidden'); 
-                    alert("Error en la búsqueda"); 
+                    document.getElementById('load').classList.add('hidden');
+                    alert("Error en la conexión con el servidor.");
                 }
             }
-            document.getElementById('q').addEventListener('keypress', (e) => e.key === 'Enter' && buscar());
         </script>
-    </body>
-    </html>
+    </body></html>
     """
-    return html_content
 
 @app.get("/buscar")
 async def api_buscar(q: str = Query(...)):
-    q_limpio = q.lower().strip()
-    # Revisar Cache
-    cache = obtener_cache(q_limpio)
-    if cache:
-        return cache
-
-    # Scrapear si no hay cache
+    q = q.lower().strip()
+    
+    # 1. Intentar buscar en las tiendas rápidas (Max, Tecnofacil, Pacifiko)
     async with httpx.AsyncClient(headers={"User-Agent": "Mozilla/5.0"}, follow_redirects=True) as client:
-        tareas_rapidas = [
-            buscar_magento(client, q_limpio, "Max", "https://www.max.com.gt"),
-            buscar_magento(client, q_limpio, "Tecnofacil", "https://www.tecnofacil.com.gt"),
-            buscar_pacifiko(client, q_limpio)
+        t_fast = [
+            buscar_magento(client, q, "Max", "https://www.max.com.gt"),
+            buscar_magento(client, q, "Tecnofacil", "https://www.tecnofacil.com.gt"),
+            buscar_pacifiko(client, q)
         ]
-        resultados_rapidos = await asyncio.gather(*tareas_rapidas)
+        r_fast = await asyncio.gather(*t_fast)
 
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        tareas_vtex = [
-            scraper_vtex_generic(browser, f"https://www.walmart.com.gt/{q_limpio}", "Walmart", "walmart.com.gt"),
-            scraper_vtex_generic(browser, f"https://www.elektra.com.gt/{q_limpio}?_q={q_limpio}&map=ft", "Elektra", "elektra.com.gt")
-        ]
-        resultados_vtex = await asyncio.gather(*tareas_vtex)
-        await browser.close()
-    
-    # Combinar
-    final = []
-    for sublist in resultados_rapidos + resultados_vtex:
-        for item in sublist:
-            final.append(item)
-    
-    if final:
-        guardar_en_db(q_limpio, final)
-        
+    # 2. Intentar buscar en tiendas lentas con Playwright (Walmart, Elektra)
+    r_slow = []
+    try:
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-setuid-sandbox"])
+            t_slow = [
+                scraper_vtex(browser, f"https://www.walmart.com.gt/{q}", "Walmart", "walmart.com.gt"),
+                scraper_vtex(browser, f"https://www.elektra.com.gt/{q}?_q={q}&map=ft", "Elektra", "elektra.com.gt")
+            ]
+            res_slow_list = await asyncio.gather(*t_slow)
+            r_slow = [item for sublist in res_slow_list for item in sublist]
+            await browser.close()
+    except Exception as e:
+        logger.error(f"Error Playwright: {e}")
+
+    final = [item for sublist in r_fast for item in sublist] + r_slow
     return final
 
-# 5. INICIO DE SERVIDOR
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8080))
