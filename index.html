@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <title>Precios GT</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-100 p-5">
+    <div class="max-w-4xl mx-auto">
+        <h1 class="text-3xl font-bold mb-5 text-center text-blue-700 uppercase tracking-tighter">Comparador Guatemala</h1>
+        <div class="flex gap-2 mb-10 bg-white p-3 rounded-xl shadow-lg">
+            <input type="text" id="q" placeholder="¿Qué buscas?" class="flex-1 p-2 outline-none text-lg">
+            <button onclick="buscar()" class="bg-blue-600 text-white px-10 py-2 rounded-lg font-bold">BUSCAR</button>
+        </div>
+        <div id="loading" class="hidden text-center text-blue-600 font-bold animate-pulse">Buscando en tiendas...</div>
+        <div id="results" class="grid grid-cols-1 md:grid-cols-3 gap-5"></div>
+    </div>
+    <script>
+        async function buscar() {
+            const q = document.getElementById('q').value;
+            const resDiv = document.getElementById('results');
+            const load = document.getElementById('loading');
+            if(!q) return;
+            resDiv.innerHTML = ''; load.classList.remove('hidden');
+            try {
+                const r = await fetch(`/api/search?q=${encodeURIComponent(q)}`);
+                const data = await r.json();
+                load.classList.add('hidden');
+                if(data.length === 0) { resDiv.innerHTML = 'No se hallaron resultados.'; return; }
+                data.forEach(p => {
+                    resDiv.innerHTML += `
+                        <div class="bg-white p-4 rounded-lg shadow flex flex-col border border-gray-200">
+                            <img src="${p.imagen}" class="h-40 object-contain mb-4">
+                            <span class="text-xs font-bold text-blue-500 uppercase">${p.tienda}</span>
+                            <h3 class="text-sm font-semibold mb-4 h-12 overflow-hidden">${p.nombre}</h3>
+                            <div class="flex justify-between items-center mt-auto">
+                                <span class="text-xl font-bold">${p.precio}</span>
+                                <a href="${p.link}" target="_blank" class="bg-blue-600 text-white p-2 rounded text-xs">Ir a tienda</a>
+                            </div>
+                        </div>`;
+                });
+            } catch(e) { load.classList.add('hidden'); alert("Error en la búsqueda"); }
+        }
+    </script>
+</body>
+</html>
